@@ -57,13 +57,22 @@ var (
 	ErrDuplicateTask = errors.New("jobqueue: duplicate task")
 	// ErrInvalidTask 入队参数非法。
 	ErrInvalidTask = errors.New("jobqueue: invalid task")
+	// ErrTaskNotFound Requeue 的任务 ID 在队列中不存在。
+	ErrTaskNotFound = errors.New("jobqueue: task not found")
+	// ErrNotRequeueable 任务当前状态不允许重投：只有 DEAD_LETTER 终态可重投，
+	// 其他在途/终态状态（含已重投产生的新一轮生命周期）都会被拒绝。
+	ErrNotRequeueable = errors.New("jobqueue: task is not requeueable")
 )
 
 // 下列辅助让调用方可以区分不同的拒绝原因。
 
-func IsQueueClosed(err error) bool { return errors.Is(err, ErrQueueClosed) }
-func IsQueueFull(err error) bool   { return errors.Is(err, ErrQueueFull) }
-func IsDuplicate(err error) bool   { return errors.Is(err, ErrDuplicateTask) }
+func IsQueueClosed(err error) bool  { return errors.Is(err, ErrQueueClosed) }
+func IsQueueFull(err error) bool    { return errors.Is(err, ErrQueueFull) }
+func IsDuplicate(err error) bool    { return errors.Is(err, ErrDuplicateTask) }
+func IsTaskNotFound(err error) bool { return errors.Is(err, ErrTaskNotFound) }
+func IsNotRequeueable(err error) bool {
+	return errors.Is(err, ErrNotRequeueable)
+}
 
 // Handler 执行单个任务的业务逻辑。返回 error 表示本次尝试失败。
 // 实现应通过 ctx 感知停机；panic 会被消费者恢复并计为一次失败。
@@ -81,6 +90,11 @@ type Task struct {
 	ID      string
 	Type    string
 	Payload []byte
+	// Key 是业务分组键（如订单号、账户号）。
+	// 非空时，同一个 Key 下的任务严格按入队顺序依次执行：前一个任务
+	// 未进入终态（含退避重试期间）不会执行后一个；不同 Key 之间仍可并发。
+	// 为空表示不参与分组有序调度，沿用全局并发消费。
+	Key string
 
 	// maxAttempts 在入队时由队列按配置写入，>0。
 	maxAttempts int
@@ -92,6 +106,13 @@ type Task struct {
 	lastErr    string
 	enqueuedAt time.Time
 	updatedAt  time.Time
+
+	// generation 生命周期代号：首次入队为 0；终态任务每被 Requeue 一次 +1。
+	// 同一逻辑任务重投后作为全新生命周期统计（attempts 清零），generation 用于
+	// 在日志中区分不同生命周期，避免与旧的尝试次数、结果混淆。
+	generation int
+	// requeued 累计被重投的次数。
+	requeued int
 }
 
 // Attempts 返回已发生的尝试次数。
@@ -105,6 +126,15 @@ func (t *Task) LastErr() string { return t.lastErr }
 
 // MaxAttempts 返回该任务允许的最大尝试次数（含首次）。
 func (t *Task) MaxAttempts() int { return t.maxAttempts }
+
+// GroupKey 返回任务所属的业务分组键，空串表示不分组。
+func (t *Task) GroupKey() string { return t.Key }
+
+// Generation 返回任务当前的生命周期代号（0 起算，每次 Requeue +1）。
+func (t *Task) Generation() int { return t.generation }
+
+// Requeued 返回该逻辑任务累计被重投的次数。
+func (t *Task) Requeued() int { return t.requeued }
 
 // Config 控制队列容量、并发与重试退避。
 type Config struct {
@@ -179,8 +209,10 @@ type Stats struct {
 	Succeeded    int
 	DeadLetter   int
 	PendingRetry int
-	// Accepted = 已被接受的任务总数（含终态）。
+	// Accepted = 已被接受的任务生命周期总数（含终态、含重投产生的新生命周期）。
 	Accepted int
+	// Requeued = 累计成功重投终态任务的次数（每次 Requeue 同时 +1 Accepted）。
+	Requeued int
 }
 
 // InFlight 返回未达终态的任务数。
@@ -188,13 +220,26 @@ func (s Stats) InFlight() int {
 	return s.Pending + s.Running + s.RetryWait
 }
 
-// Done 返回已达终态的任务数：已完成 + 待重试 + 已丢弃。
+// Done 返回已达终态的任务生命周期数：已完成 + 待重试 + 已丢弃。
 func (s Stats) Done() int {
 	return s.Succeeded + s.DeadLetter + s.PendingRetry
 }
 
 // Conserved 报告接收总数与三种归宿总数是否守恒：
 // Accepted == Succeeded + DeadLetter + PendingRetry。
+//
+// 优雅停机彻底收尾后该式恒成立；限时停机超时返回时可能仍有 RUNNING 在途，
+// 此时用 AllConserved 检查“终态 + 在途”的总量守恒。
 func (s Stats) Conserved() bool {
 	return s.Accepted == s.Done()
+}
+
+// AllConserved 报告“已完成 + 待重试 + 已丢弃 + 未完成在途”是否与接收总数一致：
+//
+//	Accepted == Succeeded + DeadLetter + PendingRetry + InFlight
+//
+// 任何时刻（含限时停机超时、边停机边投递）都必须成立，否则意味着有任务丢失
+// 或计数被重复计算。
+func (s Stats) AllConserved() bool {
+	return s.Accepted == s.Done()+s.InFlight()
 }

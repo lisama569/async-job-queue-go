@@ -9,11 +9,38 @@ import (
 )
 
 // runWorker 是单个消费者循环：从 ready 领取任务并执行。
-// ready 关闭并排空后退出（range 结束）。
+//
+// 停机语义：收到 shutdown 广播后进入“排空”阶段——非阻塞地把已就绪的任务
+// 执行完（尽量优雅收尾，保持业务键顺序），直到 ready 中暂时没有任务为止。
+// 排空结束后仍残留在 ready / 业务键队列中的任务不会被静默丢弃，而由
+// Queue.finalize 的最终兜底统一转入 PENDING_RETRY。
+// ready 通道在全部 worker 与收尾完成后才关闭，因此任何发送都不会 panic。
 func (q *Queue) runWorker(id int, _ context.Context) {
 	defer q.workersWG.Done()
-	for t := range q.ready {
-		q.execute(id, t)
+	for {
+		select {
+		case <-q.shutdown:
+			q.drainReady(id)
+			return
+		case t := <-q.ready:
+			q.execute(id, t)
+		}
+	}
+}
+
+// drainReady 在停机后排空当前已就绪的任务，使正常优雅停机（等待上限足够长）
+// 能把排队中的任务也执行完，而不是一律退化为 PENDING_RETRY。
+//
+// 非阻塞：排空过程中新残留在 ready 里的任务由 finalize 兜底归账，
+// 因此这里取空即返回，不会与“限时停机”死锁。
+func (q *Queue) drainReady(workerID int) {
+	for {
+		select {
+		case t := <-q.ready:
+			q.execute(workerID, t)
+		default:
+			return
+		}
 	}
 }
 
@@ -23,6 +50,7 @@ func (q *Queue) runWorker(id int, _ context.Context) {
 //	RUNNING   -> SUCCEEDED | RETRY_WAIT | DEAD_LETTER | PENDING_RETRY
 //
 // panic 与普通 error 一样计为一次失败尝试。
+// 任务进入终态时，若它持有某个业务键的头位置，同组下一个任务会被解锁下发。
 func (q *Queue) execute(workerID int, t *Task) {
 	q.mu.Lock()
 	// 停机收尾可能已把任务转为终态（例如 PendingRetry），跳过它。
@@ -42,38 +70,50 @@ func (q *Queue) execute(workerID int, t *Task) {
 	err := q.safeHandle(t)
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if err != nil {
 		t.lastErr = err.Error()
 	}
-	// 已被停机流程标记为终态（理论上 RUNNING 期间不会，因为只有 Close 兜底处理，
-	// 而兜底在 workers 退出之后），保持幂等防护。
+	// 幂等防护：理论上 RUNNING 期间状态不会被其他路径改写。
 	if t.state.Terminal() {
+		q.mu.Unlock()
 		return
 	}
 
+	var dispatch *Task
 	switch {
 	case err == nil:
-		q.transitionLocked(t, StateSucceeded, "handler succeeded")
-		return
+		if q.transitionLocked(t, StateSucceeded, "handler succeeded") {
+			dispatch = q.releaseGroupLocked(t.Key)
+		}
+	case errors.Is(err, context.Canceled) || errors.Is(err, ErrShuttingDown) || q.closed:
+		// 停机导致的失败，或失败时停机已经开始：交还给外部重投，保证至少一次。
+		// 不再安排退避协程——finalize 可能正在等待 wakeWG，新建协程会造成
+		// WaitGroup Add/Wait 并发误用。
+		if q.transitionLocked(t, StatePendingRetry, "shutdown interrupted: "+errText(err)) {
+			dispatch = q.releaseGroupLocked(t.Key)
+		}
+	case attempt >= t.maxAttempts:
+		if q.transitionLocked(t, StateDeadLetter,
+			fmt.Sprintf("max attempts=%d reached, last error: %s", t.maxAttempts, errText(err))) {
+			dispatch = q.releaseGroupLocked(t.Key)
+		}
+	default:
+		// 退避后重试。任务仍持有业务键的头位置（不退组），退避结束后重新投递。
+		if q.transitionLocked(t, StateRetryWait, "attempt failed: "+errText(err)) && !q.closed {
+			q.scheduleRetryLocked(t, attempt)
+		}
 	}
+	q.mu.Unlock()
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, ErrShuttingDown) {
-		// 停机导致的失败：交还给外部重投，保证至少一次。
-		q.transitionLocked(t, StatePendingRetry, "shutdown interrupted: "+err.Error())
-		return
-	}
+	// 锁外下发同组下一个任务（deliver 自带停机保护）。
+	q.deliver(dispatch)
+}
 
-	if attempt >= t.maxAttempts {
-		q.transitionLocked(t, StateDeadLetter,
-			fmt.Sprintf("max attempts=%d reached, last error: %s", t.maxAttempts, err.Error()))
-		return
+func errText(err error) string {
+	if err == nil {
+		return ""
 	}
-
-	// 退避后重试。先迁移状态并由调度 goroutine 负责后续投递。
-	if q.transitionLocked(t, StateRetryWait, "attempt failed: "+err.Error()) {
-		q.scheduleRetryLocked(t, attempt)
-	}
+	return err.Error()
 }
 
 // ErrShuttingDown 在停机时传给 Handler 的 context 中标记（保留语义说明）。
@@ -105,7 +145,8 @@ func (q *Queue) safeHandle(t *Task) (err error) {
 // scheduleRetryLocked 在退避结束后把任务重新投递给 ready。
 // 调用方持有 q.mu；goroutine 启动后自行加锁。
 //
-// 退避期间 Close 会关闭 shutdown，等待立即结束并转入 PendingRetry。
+// 退避期间 Close 会关闭 shutdown，等待立即结束并转入 PendingRetry，
+// 同时释放它占有的业务键头位置（残留同组任务交停机兜底处理）。
 func (q *Queue) scheduleRetryLocked(t *Task, attempt int) {
 	delay := q.backoff(attempt)
 	q.wakeWG.Add(1)
@@ -114,31 +155,36 @@ func (q *Queue) scheduleRetryLocked(t *Task, attempt int) {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
+		case <-q.shutdown:
+			q.mu.Lock()
+			if !t.state.Terminal() {
+				if q.transitionLocked(t, StatePendingRetry,
+					fmt.Sprintf("shutdown interrupted backoff after attempt=%d", attempt)) {
+					_ = q.releaseGroupLocked(t.Key)
+				}
+			}
+			q.mu.Unlock()
 		case <-timer.C:
 			q.mu.Lock()
 			// 只有仍处于 RETRY_WAIT 才重新投递；状态机拒绝任何覆盖。
-			if q.transitionLocked(t, StatePending, "backoff elapsed, requeue") {
-				q.mu.Unlock()
-				select {
-				case q.ready <- t:
-				case <-q.shutdown:
-					// Close 已开始：让收尾兜底转 PendingRetry。
-					q.mu.Lock()
-					if !t.state.Terminal() {
-						q.transitionLocked(t, StatePendingRetry, "shutdown during requeue")
-					}
-					q.mu.Unlock()
-				}
-			} else {
-				q.mu.Unlock()
-			}
-		case <-q.shutdown:
-			q.mu.Lock()
-			if q.transitionLocked(t, StatePendingRetry,
-				fmt.Sprintf("shutdown interrupted backoff after attempt=%d", attempt)) {
-				_ = t.lastErr
-			}
+			ok := q.transitionLocked(t, StatePending, "backoff elapsed, requeue")
 			q.mu.Unlock()
+			if !ok {
+				return
+			}
+			// 仍是同组头任务（active 保持），直接重新投递。
+			select {
+			case q.ready <- t:
+			case <-q.shutdown:
+				// Close 已开始：转 PendingRetry 并释放组头位置。
+				q.mu.Lock()
+				if !t.state.Terminal() {
+					if q.transitionLocked(t, StatePendingRetry, "shutdown during requeue") {
+						_ = q.releaseGroupLocked(t.Key)
+					}
+				}
+				q.mu.Unlock()
+			}
 		}
 	}()
 }
