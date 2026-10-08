@@ -24,9 +24,13 @@ type Queue struct {
 	handler Handler
 	logger  Logger
 
-	mu     sync.Mutex
-	tasks  map[string]*Task // 所有被接受的任务（含终态）
-	counts Stats            // 各状态计数
+	mu    sync.Mutex
+	tasks map[string]*Task // 每个 ID 最新生命周期的任务（含终态）
+	// history 保存每个 ID 被替换/重投前的历史生命周期，最新的在 tasks 中。
+	history map[string][]*Task
+	// groups 维护每个业务键的有序消费状态。
+	groups map[string]*keyGroup
+	counts Stats // 各状态计数
 	closed bool
 
 	// ready 投递已就绪、可立即执行的任务。
@@ -34,12 +38,23 @@ type Queue struct {
 
 	// wakeWG 等待退避调度 goroutine 退出。
 	wakeWG sync.WaitGroup
+	// pendingWakes 是当前存活的退避调度 goroutine 数（仅在 q.mu 下增减）。
+	// 协调器据此在锁内判定“不会再有新调度”，再到锁外 wakeWG.Wait。
+	pendingWakes int
 	// workersWG 等待消费者退出。
 	workersWG sync.WaitGroup
+	// dispatching 跟踪所有在途的 ready 发送，关闭 ready 前先等待其归零，
+	// 杜绝“向已关闭 channel 发送”。
+	dispatching sync.WaitGroup
 
-	stopOnce  sync.Once
-	readyOnce sync.Once
-	shutdown  chan struct{}
+	stopOnce     sync.Once
+	readyOnce    sync.Once
+	finalizeOnce sync.Once
+	shutdown     chan struct{}
+
+	// finalized 在强制收尾完成后关闭；finalStats 为收尾时刻的一致快照。
+	finalized  chan struct{}
+	finalStats Stats
 }
 
 // New 创建队列并启动 cfg.Workers 个消费者。
@@ -55,12 +70,15 @@ func New(cfg Config, handler Handler, logger Logger) (*Queue, error) {
 		logger = nopLogger{}
 	}
 	q := &Queue{
-		cfg:      cfg,
-		handler:  handler,
-		logger:   logger,
-		tasks:    make(map[string]*Task),
-		ready:    make(chan *Task, cfg.Capacity),
-		shutdown: make(chan struct{}),
+		cfg:       cfg,
+		handler:   handler,
+		logger:    logger,
+		tasks:     make(map[string]*Task),
+		history:   make(map[string][]*Task),
+		groups:    make(map[string]*keyGroup),
+		ready:     make(chan *Task, cfg.Capacity),
+		shutdown:  make(chan struct{}),
+		finalized: make(chan struct{}),
 	}
 	ctx := context.Background()
 	for i := 0; i < cfg.Workers; i++ {
@@ -70,59 +88,15 @@ func New(cfg Config, handler Handler, logger Logger) (*Queue, error) {
 	return q, nil
 }
 
-// Enqueue 提交一个逻辑任务。拒绝原因可用 errors.Is 区分：
+// Enqueue 提交一个逻辑任务（不分组，走全局并发池）。拒绝原因可用 errors.Is 区分：
 //   - ErrInvalidTask：ID 为空；
 //   - ErrQueueClosed：队列已关闭；
 //   - ErrQueueFull：未完成任务数已达 Capacity；
 //   - ErrDuplicateTask：相同 ID 的任务仍未达终态（去重）。
+//
+// 需要按业务键有序消费时使用 EnqueueKey。
 func (q *Queue) Enqueue(id, taskType string, payload []byte) error {
-	if id == "" {
-		return ErrInvalidTask
-	}
-	now := time.Now()
-	t := &Task{
-		ID:          id,
-		Type:        taskType,
-		Payload:     payload,
-		maxAttempts: q.cfg.MaxAttempts,
-		state:       StatePending,
-		enqueuedAt:  now,
-		updatedAt:   now,
-	}
-
-	q.mu.Lock()
-	switch {
-	case q.closed:
-		q.mu.Unlock()
-		return ErrQueueClosed
-	}
-	if existing, ok := q.tasks[id]; ok && !existing.state.Terminal() {
-		existingState := existing.state.String()
-		q.mu.Unlock()
-		q.logTransition(t, t.state, t.state, "reject duplicate: existing="+existingState)
-		return ErrDuplicateTask
-	}
-	if q.counts.InFlight() >= q.cfg.Capacity {
-		q.mu.Unlock()
-		q.logTransition(t, StatePending, StatePending, "reject: queue full")
-		return ErrQueueFull
-	}
-	// 同一 ID 的历史任务已达终态时允许重新提交，覆盖旧记录。
-	q.tasks[id] = t
-	q.counts.Accepted++
-	q.counts.Pending++
-	q.mu.Unlock()
-
-	q.logTransition(t, StatePending, StatePending, "enqueued")
-
-	// 持有锁外发送：ready 容量等于 Capacity，而在途任务数受 Capacity 约束，
-	// 且每个在途任务至多占一个 ready 槽位，因此发送不会阻塞、不会失败。
-	select {
-	case q.ready <- t:
-	case <-q.shutdown:
-		// 极端竞态：入队解锁后、发送前 Close 触发。停机收尾会统一处理该任务。
-	}
-	return nil
+	return q.EnqueueKey("", id, taskType, payload)
 }
 
 // Stats 返回当前任务计数的一致快照。
@@ -165,52 +139,77 @@ func (q *Queue) TaskLastError(id string) (string, bool) {
 	return t.lastErr, true
 }
 
-// Close 发起优雅停机并等待全部任务进入终态后返回最终计数。
+// Close 发起停机，并在 ctx 给定的等待上限内等待在途任务收尾。
 //
-// 收尾规则：
-//   - 正在执行的任务：等待其返回，成功计入 Succeeded，失败计入 PendingRetry；
+// 收尾规则（优雅路径，等待上限充足时）：
+//   - 正在执行的任务：等待其返回，成功计入 Succeeded，业务失败计入重试/死信，
+//     因停机 ctx 取消而中断的计入 PendingRetry；
 //   - 退避中 / 尚未执行的任务：计入 PendingRetry（至少一次，交还给外部重投）；
 //   - 达到 MaxAttempts 的失败任务计入 DeadLetter。
 //
-// 守恒：Accepted == Succeeded + DeadLetter + PendingRetry。
-// ctx 超时则返回 ctx.Err()，但内部收尾仍会继续直至完成。
+// 限时安全：等待上限到达（ctx 超时/取消）时，所有仍未达终态的任务会被
+// 立即强制落到 PENDING_RETRY（明确可观测，不静默丢弃、计数不凭空消失），
+// Close 返回冻结的最终计数与 ctx.Err()。此后仍在执行的 Handler 可继续跑完，
+// 但其结果不再改变计数（终态不可覆盖，会打印 ILLEGAL 迁移日志）。
+//
+// 守恒（无论等待上限多少、是否超时）：
+//
+//	Accepted == Succeeded + DeadLetter + PendingRetry == Enqueued + Requeued
+//
+// 多次调用 Close 安全：首次调用启动停机；收尾完成后每次都返回同一份最终计数。
+// 停机进行中再投递（Enqueue/Requeue）一律被 ErrQueueClosed 明确拒绝。
 func (q *Queue) Close(ctx context.Context) (Stats, error) {
 	q.stopOnce.Do(func() {
 		q.mu.Lock()
 		q.closed = true
 		q.mu.Unlock()
-		close(q.shutdown) // 打断退避等待与入队发送
+		close(q.shutdown) // 打断退避等待、Handler ctx
+
+		// 协调 goroutine：等所有在途 ready 发送结束 → 在 q.mu 内关闭 ready
+		// （与持锁登记的发送严格互斥，杜绝向已关闭 channel 发送）→ 等退避/worker
+		// 退出 → 优雅兜底收尾。即便调用方因超时提前返回，收尾仍在后台继续直到冻结。
+		go func() {
+			// 停机已置 closed 并广播 shutdown：execute 不会再走到
+			// scheduleRetryLocked（新失败要么 ctx 取消→PENDING_RETRY，要么
+			// 状态机拒绝迁移），因此 pendingWakes 只减不增。持锁轮询其归零，
+			// 归零后不会再有 wakeWG.Add，可安全在锁外 Wait。
+			for {
+				q.mu.Lock()
+				left := q.pendingWakes
+				q.mu.Unlock()
+				if left == 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			q.wakeWG.Wait()
+			// 再等所有已登记的 ready 发送结束，然后在 q.mu 内关闭 ready，
+			// 与持锁登记的发送严格互斥，杜绝向已关闭 channel 发送。
+			q.dispatching.Wait()
+			q.mu.Lock()
+			q.readyOnce.Do(func() { close(q.ready) })
+			q.mu.Unlock()
+			q.workersWG.Wait()
+			q.forceFinalize("shutdown: unfinished task handed back")
+		}()
 	})
 
-	// 1) 等待退避调度 goroutine 退出：它们会把退避中的任务转入 PendingRetry。
-	waitWake := make(chan struct{})
-	go func() { q.wakeWG.Wait(); close(waitWake) }()
-	select {
-	case <-waitWake:
-	case <-ctx.Done():
-		return q.Stats(), ctx.Err()
+	// 已收尾：直接返回冻结的最终计数（等待上限只约束“等待”，不再改变结果）。
+	if s, done := q.finalSnapshot(); done {
+		return s, nil
 	}
 
-	// 2) 退避者已清空后关闭 ready，消费者排空已就绪任务后退出。
-	q.readyOnce.Do(func() { close(q.ready) })
-	waitWorkers := make(chan struct{})
-	go func() { q.workersWG.Wait(); close(waitWorkers) }()
+	// 在调用方的等待上限内等收尾完成；超时则立即强制收尾（幂等）。
 	select {
-	case <-waitWorkers:
+	case <-q.finalized:
 	case <-ctx.Done():
-		return q.Stats(), ctx.Err()
+		q.forceFinalize("shutdown deadline exceeded: unfinished task handed back")
+		s, _ := q.finalSnapshot()
+		return s, ctx.Err()
 	}
 
-	// 3) 兜底：把仍未达终态的任务（ready 中残留等）全部转入 PendingRetry。
-	q.mu.Lock()
-	for _, t := range q.tasks {
-		if !t.state.Terminal() {
-			q.transitionLocked(t, StatePendingRetry, "shutdown: unfinished task handed back")
-		}
-	}
-	final := q.counts
-	q.mu.Unlock()
-	return final, nil
+	s, _ := q.finalSnapshot()
+	return s, nil
 }
 
 // allowedTransitions 定义合法状态迁移表；非法迁移会被拒绝并打印告警，
@@ -280,8 +279,12 @@ func (q *Queue) decCountLocked(s TaskState) {
 	}
 }
 
-// logTransition 打印任务标识、尝试次数与状态迁移。
+// logTransition 打印任务标识、业务键、生命周期、尝试次数与状态迁移。
 func (q *Queue) logTransition(t *Task, from, to TaskState, cause string) {
-	q.logger.Printf("task=%s type=%s attempt=%d %s -> %s cause=%q",
-		t.ID, t.Type, t.attempts, from, to, cause)
+	key := t.key
+	if key == "" {
+		key = "-"
+	}
+	q.logger.Printf("task=%s key=%s origin=%s epoch=%d type=%s attempt=%d %s -> %s cause=%q",
+		t.ID, key, t.origin, t.epoch, t.Type, t.attempts, from, to, cause)
 }

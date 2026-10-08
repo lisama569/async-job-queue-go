@@ -57,6 +57,10 @@ var (
 	ErrDuplicateTask = errors.New("jobqueue: duplicate task")
 	// ErrInvalidTask 入队参数非法。
 	ErrInvalidTask = errors.New("jobqueue: invalid task")
+	// ErrTaskNotFound 指定 ID 的任务在队列中没有记录。
+	ErrTaskNotFound = errors.New("jobqueue: task not found")
+	// ErrNotRequeueable 任务当前状态不允许重投（只有 DEAD_LETTER 可重投）。
+	ErrNotRequeueable = errors.New("jobqueue: task is not requeueable")
 )
 
 // 下列辅助让调用方可以区分不同的拒绝原因。
@@ -82,17 +86,51 @@ type Task struct {
 	Type    string
 	Payload []byte
 
+	// key 是业务分组键（顺序消费）；空串表示不分组，走全局并发池。
+	key string
+	// origin 标记本次生命周期的来源：入队 / 终态重投。
+	origin TaskOrigin
+	// epoch 是同一 ID 的第几次生命周期（1 起），每次重投 +1。
+	epoch int
+
 	// maxAttempts 在入队时由队列按配置写入，>0。
 	maxAttempts int
 
-	// mu 保护以下运行期字段；由 Queue.mu 统一持有（不单独加锁），
-	// 仅状态迁移时更新，因此无需额外锁。
+	// 下列字段仅在 Queue.mu 保护下更新（见 Queue 字段注释）。
 	attempts   int
 	state      TaskState
 	lastErr    string
 	enqueuedAt time.Time
 	updatedAt  time.Time
 }
+
+// TaskOrigin 标记任务本次生命周期的来源。
+type TaskOrigin int
+
+const (
+	// OriginEnqueue 普通入队。
+	OriginEnqueue TaskOrigin = iota
+	// OriginRequeue 终态（DEAD_LETTER）任务重投。
+	OriginRequeue
+)
+
+func (o TaskOrigin) String() string {
+	switch o {
+	case OriginRequeue:
+		return "REQUEUE"
+	default:
+		return "ENQUEUE"
+	}
+}
+
+// Key 返回任务所属的业务分组键；空串表示未分组。
+func (t *Task) Key() string { return t.key }
+
+// Origin 返回本次生命周期的来源。
+func (t *Task) Origin() TaskOrigin { return t.origin }
+
+// Epoch 返回同一 ID 的生命周期序号（首次入队为 1）。
+func (t *Task) Epoch() int { return t.epoch }
 
 // Attempts 返回已发生的尝试次数。
 func (t *Task) Attempts() int { return t.attempts }
@@ -179,8 +217,12 @@ type Stats struct {
 	Succeeded    int
 	DeadLetter   int
 	PendingRetry int
-	// Accepted = 已被接受的任务总数（含终态）。
+	// Accepted = 已被接受的任务生命周期总数（含终态、含重投）。
 	Accepted int
+	// Enqueued = 通过 Enqueue/EnqueueKey 接受的生命周期数（不含重投）。
+	Enqueued int
+	// Requeued = 通过 Requeue/RequeueDeadLetters 接受的重投生命周期数。
+	Requeued int
 }
 
 // InFlight 返回未达终态的任务数。
@@ -188,13 +230,47 @@ func (s Stats) InFlight() int {
 	return s.Pending + s.Running + s.RetryWait
 }
 
-// Done 返回已达终态的任务数：已完成 + 待重试 + 已丢弃。
+// Done 返回已达终态的任务生命周期数：已完成 + 待重试 + 已丢弃。
 func (s Stats) Done() int {
 	return s.Succeeded + s.DeadLetter + s.PendingRetry
 }
 
 // Conserved 报告接收总数与三种归宿总数是否守恒：
-// Accepted == Succeeded + DeadLetter + PendingRetry。
+// Accepted == Succeeded + DeadLetter + PendingRetry，且
+// Accepted == Enqueued + Requeued。
 func (s Stats) Conserved() bool {
-	return s.Accepted == s.Done()
+	return s.Accepted == s.Done() && s.Accepted == s.Enqueued+s.Requeued
+}
+
+// TaskInfo 是任务快照，供重投条件判断与外部观测使用（值拷贝，不含内部字段）。
+type TaskInfo struct {
+	ID          string
+	Type        string
+	Payload     []byte
+	Key         string
+	Origin      TaskOrigin
+	Epoch       int
+	Attempts    int
+	State       TaskState
+	MaxAttempts int
+	LastErr     string
+	EnqueuedAt  time.Time
+	UpdatedAt   time.Time
+}
+
+func (t *Task) infoLocked() TaskInfo {
+	return TaskInfo{
+		ID:          t.ID,
+		Type:        t.Type,
+		Payload:     t.Payload,
+		Key:         t.key,
+		Origin:      t.origin,
+		Epoch:       t.epoch,
+		Attempts:    t.attempts,
+		State:       t.state,
+		MaxAttempts: t.maxAttempts,
+		LastErr:     t.lastErr,
+		EnqueuedAt:  t.enqueuedAt,
+		UpdatedAt:   t.updatedAt,
+	}
 }

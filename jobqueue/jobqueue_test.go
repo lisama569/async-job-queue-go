@@ -26,15 +26,23 @@ type flakyHandler struct {
 	release  map[string]chan struct{}
 	runs     map[string]int
 	block    bool
+	// perLifecycle 为 true 时，失败计数按 Task.Epoch 独立（用于重投测试）。
+	perLifecycle bool
+	// failEpoch1 中的 ID 仅在 epoch==1 时失败（首个生命周期死信、重投后成功）。
+	failEpoch1 map[string]bool
+	// runsByEpoch 按 "id@epoch" 记录每个生命周期内的尝试次数。
+	runsByEpoch map[string]int
 }
 
 func newFlakyHandler() *flakyHandler {
 	return &flakyHandler{
-		failN:    map[string]int{},
-		panicIDs: map[string]bool{},
-		started:  map[string]chan struct{}{},
-		release:  map[string]chan struct{}{},
-		runs:     map[string]int{},
+		failN:       map[string]int{},
+		panicIDs:    map[string]bool{},
+		failEpoch1:  map[string]bool{},
+		started:     map[string]chan struct{}{},
+		release:     map[string]chan struct{}{},
+		runs:        map[string]int{},
+		runsByEpoch: map[string]int{},
 	}
 }
 
@@ -62,6 +70,15 @@ func (h *flakyHandler) Handle(ctx context.Context, t *Task) error {
 	doPanic := h.panicIDs[t.ID]
 	start := h.started[t.ID]
 	rel := h.release[t.ID]
+	// failEpoch1：仅首个生命周期失败（重投后的新生命周期成功）。
+	if h.failEpoch1[t.ID] && t.epoch > 1 {
+		fail = 0
+	}
+	if h.perLifecycle {
+		key := fmt.Sprintf("%s@%d", t.ID, t.epoch)
+		h.runsByEpoch[key]++
+		n = h.runsByEpoch[key] // 每个生命周期独立计失败次数
+	}
 	h.mu.Unlock()
 
 	if start != nil {

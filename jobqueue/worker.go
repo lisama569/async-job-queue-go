@@ -42,37 +42,46 @@ func (q *Queue) execute(workerID int, t *Task) {
 	err := q.safeHandle(t)
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if err != nil {
 		t.lastErr = err.Error()
 	}
-	// 已被停机流程标记为终态（理论上 RUNNING 期间不会，因为只有 Close 兜底处理，
-	// 而兜底在 workers 退出之后），保持幂等防护。
+	// 已被停机流程标记为终态（强制收尾可能在 Handler 返回前发生）：
+	// 保持幂等防护；该任务的同组后继也由收尾统一处理，不在这里派发。
 	if t.state.Terminal() {
+		q.mu.Unlock()
 		return
 	}
 
+	var handoff *Task
 	switch {
 	case err == nil:
-		q.transitionLocked(t, StateSucceeded, "handler succeeded")
-		return
-	}
-
-	if errors.Is(err, context.Canceled) || errors.Is(err, ErrShuttingDown) {
+		if q.transitionLocked(t, StateSucceeded, "handler succeeded") {
+			handoff = q.afterTerminalLocked(t)
+		}
+	case errors.Is(err, context.Canceled) || errors.Is(err, ErrShuttingDown):
 		// 停机导致的失败：交还给外部重投，保证至少一次。
-		q.transitionLocked(t, StatePendingRetry, "shutdown interrupted: "+err.Error())
-		return
+		if q.transitionLocked(t, StatePendingRetry, "shutdown interrupted: "+err.Error()) {
+			handoff = q.afterTerminalLocked(t)
+		}
+	case attempt >= t.maxAttempts:
+		if q.transitionLocked(t, StateDeadLetter,
+			fmt.Sprintf("max attempts=%d reached, last error: %s", t.maxAttempts, err.Error())) {
+			handoff = q.afterTerminalLocked(t)
+		}
+	default:
+		// 退避后重试。先迁移状态并由调度 goroutine 负责后续投递；同组后继
+		// 必须等退避重试也结束（进入终态）后才派发，因此此处不 handoff。
+		if q.transitionLocked(t, StateRetryWait, "attempt failed: "+err.Error()) {
+			q.scheduleRetryLocked(t, attempt)
+		}
 	}
+	q.mu.Unlock()
 
-	if attempt >= t.maxAttempts {
-		q.transitionLocked(t, StateDeadLetter,
-			fmt.Sprintf("max attempts=%d reached, last error: %s", t.maxAttempts, err.Error()))
-		return
-	}
-
-	// 退避后重试。先迁移状态并由调度 goroutine 负责后续投递。
-	if q.transitionLocked(t, StateRetryWait, "attempt failed: "+err.Error()) {
-		q.scheduleRetryLocked(t, attempt)
+	// 锁外登记并派发同组下一个任务，避免在 q.mu 上阻塞发送。
+	// registerDispatch 与 close(ready) 由 q.mu 互斥：停机已开始则放弃发送，
+	// 后继任务由停机收尾统一转入 PENDING_RETRY。
+	if handoff != nil && q.registerDispatch(handoff) {
+		q.dispatchScheduled(handoff, "previous group task finished")
 	}
 }
 
@@ -103,12 +112,14 @@ func (q *Queue) safeHandle(t *Task) (err error) {
 }
 
 // scheduleRetryLocked 在退避结束后把任务重新投递给 ready。
-// 调用方持有 q.mu；goroutine 启动后自行加锁。
+// 调用方持有 q.mu；wakeWG.Add 也在此处完成（与 Close 的 wakeWG.Wait 由
+// q.mu 互斥），goroutine 内部只负责等待与状态迁移。
 //
 // 退避期间 Close 会关闭 shutdown，等待立即结束并转入 PendingRetry。
 func (q *Queue) scheduleRetryLocked(t *Task, attempt int) {
 	delay := q.backoff(attempt)
 	q.wakeWG.Add(1)
+	q.pendingWakes++
 	go func() {
 		defer q.wakeWG.Done()
 		timer := time.NewTimer(delay)
@@ -117,27 +128,21 @@ func (q *Queue) scheduleRetryLocked(t *Task, attempt int) {
 		case <-timer.C:
 			q.mu.Lock()
 			// 只有仍处于 RETRY_WAIT 才重新投递；状态机拒绝任何覆盖。
-			if q.transitionLocked(t, StatePending, "backoff elapsed, requeue") {
-				q.mu.Unlock()
-				select {
-				case q.ready <- t:
-				case <-q.shutdown:
-					// Close 已开始：让收尾兜底转 PendingRetry。
-					q.mu.Lock()
-					if !t.state.Terminal() {
-						q.transitionLocked(t, StatePendingRetry, "shutdown during requeue")
-					}
-					q.mu.Unlock()
-				}
-			} else {
-				q.mu.Unlock()
+			// 该任务仍是同组 head（退避期间后继不派发），故只投递自身。
+			canSend := q.transitionLocked(t, StatePending, "backoff elapsed, requeue")
+			q.pendingWakes--
+			q.mu.Unlock()
+			// 解锁后再登记发送（与 close(ready) 互斥）；停机则放弃，任务由
+			// 停机收尾转入 PENDING_RETRY（它现在已是 PENDING，收尾会处理）。
+			if canSend && q.registerDispatch(t) {
+				q.dispatchScheduled(t, "backoff elapsed")
 			}
 		case <-q.shutdown:
 			q.mu.Lock()
-			if q.transitionLocked(t, StatePendingRetry,
-				fmt.Sprintf("shutdown interrupted backoff after attempt=%d", attempt)) {
-				_ = t.lastErr
-			}
+			// head 退避被停机打断：转入 PENDING_RETRY；同组等待任务由收尾统一处理。
+			q.transitionLocked(t, StatePendingRetry,
+				fmt.Sprintf("shutdown interrupted backoff after attempt=%d", attempt))
+			q.pendingWakes--
 			q.mu.Unlock()
 		}
 	}()
